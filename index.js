@@ -15,8 +15,7 @@ const {
 const { createClient } = require("@supabase/supabase-js");
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID =
-  process.env.CHANNEL_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
@@ -122,24 +121,28 @@ async function getUserRecord(userId) {
 
   const newRecord = createDefaultRecord(userId);
 
-  const { data: createdRecord, error: insertError } =
-    await supabase
-      .from("time_records")
-      .insert(newRecord)
-      .select("*")
-      .single();
+  const {
+    data: createdRecord,
+    error: insertError,
+  } = await supabase
+    .from("time_records")
+    .insert(newRecord)
+    .select("*")
+    .single();
 
   if (insertError) {
     /*
      * Another request may have created the record at nearly
      * the same time. Try loading it once more.
      */
-    const { data: existingRecord, error: retryError } =
-      await supabase
-        .from("time_records")
-        .select("*")
-        .eq("user_id", userId)
-        .single();
+    const {
+      data: existingRecord,
+      error: retryError,
+    } = await supabase
+      .from("time_records")
+      .select("*")
+      .eq("user_id", userId)
+      .single();
 
     if (retryError) {
       throw new Error(
@@ -244,9 +247,11 @@ function formatDuration(milliseconds) {
   );
 
   const hours = Math.floor(totalSeconds / 3600);
+
   const minutes = Math.floor(
     (totalSeconds % 3600) / 60
   );
+
   const seconds = totalSeconds % 60;
 
   return {
@@ -258,6 +263,69 @@ function formatDuration(milliseconds) {
   };
 }
 
+/*
+ * Button displayed directly under a successful
+ * Clock In message.
+ */
+function buildClockedInActions() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("time_clock_out")
+      .setLabel("Clock Out")
+      .setEmoji("🔴")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+/*
+ * Buttons displayed after Clock Out or Total Hours
+ * submission.
+ */
+function buildClockedOutActions() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("time_clock_in")
+      .setLabel("Clock In")
+      .setEmoji("🟢")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("time_total_hours")
+      .setLabel("Total Hours")
+      .setEmoji("🧾")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+/*
+ * Private Yes/No confirmation buttons for Total Hours.
+ *
+ * The current total and session count are included in the
+ * custom ID. This prevents an older confirmation from
+ * resetting newly recorded hours.
+ */
+function buildTotalHoursConfirmation(
+  userId,
+  expectedMilliseconds,
+  expectedSessions
+) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(
+        `time_total_hours_confirm:${userId}:${expectedMilliseconds}:${expectedSessions}`
+      )
+      .setLabel("Yes, Submit & Reset")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId(
+        `time_total_hours_cancel:${userId}`
+      )
+      .setLabel("No, Cancel")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
 function buildPanel() {
   const embed = new EmbedBuilder()
     .setTitle("Employee Time Clock")
@@ -267,9 +335,10 @@ function buildPanel() {
         "",
         "🟢 **Clock In** — starts your personal timer",
         "🔴 **Clock Out** — stops your timer and adds the session",
-        "🧾 **Total Hours** — posts your total and resets completed hours",
+        "🧾 **Total Hours** — submits your completed total and resets it to zero",
         "",
         "**Important:** Clock out before requesting Total Hours.",
+        "A private Yes/No warning appears before any reset.",
         "All displayed times use Philippine Time.",
       ].join("\n")
     )
@@ -317,7 +386,9 @@ async function createOrRefreshPanel(channel) {
         );
 
       await oldPanel.edit(buildPanel());
+
       console.log("Existing panel refreshed.");
+
       return;
     } catch (error) {
       console.log(
@@ -377,7 +448,9 @@ client.once(
 client.on(
   Events.InteractionCreate,
   async (interaction) => {
-    if (!interaction.isButton()) return;
+    if (!interaction.isButton()) {
+      return;
+    }
 
     if (
       !interaction.customId.startsWith(
@@ -399,22 +472,237 @@ client.on(
       return;
     }
 
-    /*
-     * Deferring prevents Discord's three-second interaction
-     * timeout while the database request is running.
-     */
-    await interaction.deferReply();
+    const customId =
+      interaction.customId;
 
-    const userId = interaction.user.id;
-    const now = Date.now();
+    const userId =
+      interaction.user.id;
+
+    const now =
+      Date.now();
+
+    const confirmPrefix =
+      "time_total_hours_confirm:";
+
+    const cancelPrefix =
+      "time_total_hours_cancel:";
+
+    const isTotalHoursConfirmation =
+      customId.startsWith(confirmPrefix);
+
+    const isTotalHoursCancellation =
+      customId.startsWith(cancelPrefix);
+
+    /*
+     * The confirmation buttons contain the employee's Discord ID.
+     * This prevents another employee from using somebody else's
+     * confirmation buttons if the message visibility changes later.
+     */
+    if (
+      isTotalHoursConfirmation ||
+      isTotalHoursCancellation
+    ) {
+      const expectedUserId =
+        customId.split(":")[1];
+
+      if (expectedUserId !== userId) {
+        await interaction.reply({
+          content:
+            "⚠️ This Total Hours confirmation belongs to another employee.",
+          ephemeral: true,
+        });
+
+        return;
+      }
+    }
+
+    /*
+     * User selected No.
+     */
+    if (isTotalHoursCancellation) {
+      await interaction.update({
+        content:
+          "✅ Total Hours cancelled. No hours were submitted or reset.",
+        components: [],
+      });
+
+      return;
+    }
+
+    /*
+     * User selected Yes.
+     */
+    if (isTotalHoursConfirmation) {
+      /*
+       * Remove the Yes/No buttons immediately so the destructive
+       * action cannot be clicked twice while the database is saving.
+       */
+      await interaction.update({
+        content:
+          "⏳ Submitting your completed hours and resetting the total...",
+        components: [],
+      });
+
+      try {
+        const record =
+          await getUserRecord(userId);
+
+        /*
+         * Re-check the record because its state may have changed
+         * after the warning was first displayed.
+         */
+        if (record.clocked_in_at !== null) {
+          await interaction.editReply({
+            content:
+              `⚠️ ${interaction.user}, you are currently clocked in. ` +
+              "Clock out first, then request Total Hours again.",
+            components: [],
+          });
+
+          return;
+        }
+
+        if (
+          Number(
+            record.accumulated_milliseconds
+          ) <= 0
+        ) {
+          await interaction.editReply({
+            content:
+              `🧾 ${interaction.user}, you currently have **0.00 completed hours**. Nothing was reset.`,
+            components: [],
+          });
+
+          return;
+        }
+
+        const confirmationParts =
+          customId.split(":");
+
+        const expectedMilliseconds =
+          Number(confirmationParts[2]);
+
+        const expectedSessions =
+          Number(confirmationParts[3]);
+
+        /*
+         * Prevent an old confirmation message from resetting
+         * hours that were recorded after the warning appeared.
+         */
+        if (
+          Number(
+            record.accumulated_milliseconds
+          ) !== expectedMilliseconds ||
+          record.sessions.length !== expectedSessions
+        ) {
+          await interaction.editReply({
+            content: [
+              "⚠️ Your completed hours changed after this warning was opened.",
+              "Nothing was submitted or reset.",
+              "Please click **Total Hours** again to review the updated total.",
+            ].join("\n"),
+            components: [],
+          });
+
+          return;
+        }
+
+        const submittedMilliseconds =
+          Number(
+            record.accumulated_milliseconds
+          );
+
+        const submittedSessions =
+          record.sessions.length;
+
+        const total =
+          formatDuration(
+            submittedMilliseconds
+          );
+
+        /*
+         * Reset the completed total only after the employee
+         * selected Yes.
+         */
+        record.accumulated_milliseconds = 0;
+        record.sessions = [];
+        record.last_submitted_at = now;
+        record.last_submitted_milliseconds =
+          submittedMilliseconds;
+
+        await saveUserRecord(record);
+
+        /*
+         * Update the private confirmation.
+         */
+        await interaction.editReply({
+          content:
+            "✅ Confirmed. Your completed hours were submitted and reset.",
+          components: [],
+        });
+
+        /*
+         * Post the final total publicly in the channel,
+         * matching the original bot behavior.
+         */
+        await interaction.followUp({
+          content: [
+            "🧾 **TOTAL HOURS SUBMITTED AND RESET**",
+            `Employee: ${interaction.user}`,
+            `Completed Sessions: **${submittedSessions}**`,
+            `Total: **${total.readable}**`,
+            `Invoice Hours: **${total.decimalHours} hours**`,
+            `Submitted: **${formatPhilippineDateTime(
+              now
+            )}**`,
+            "",
+            "This employee's completed total is now reset to **0.00 hours**.",
+          ].join("\n"),
+
+          components: [
+            buildClockedOutActions(),
+          ],
+
+          ephemeral: false,
+        });
+      } catch (error) {
+        console.error(
+          "Total-hours confirmation error:",
+          error
+        );
+
+        await interaction
+          .editReply({
+            content:
+              "❌ The bot could not submit or reset your hours. Please try again.",
+            components: [],
+          })
+          .catch(console.error);
+      }
+
+      return;
+    }
+
+    /*
+     * Total Hours starts with a private warning.
+     *
+     * Clock In and Clock Out continue to post regular
+     * channel messages.
+     */
+    await interaction.deferReply({
+      ephemeral:
+        customId === "time_total_hours",
+    });
 
     try {
       const record =
         await getUserRecord(userId);
 
+      /*
+       * CLOCK IN
+       */
       if (
-        interaction.customId ===
-        "time_clock_in"
+        customId === "time_clock_in"
       ) {
         if (
           record.clocked_in_at !== null
@@ -425,6 +713,14 @@ client.on(
               `Your session started at **${formatPhilippineDateTime(
                 record.clocked_in_at
               )}**.`,
+
+            /*
+             * Include a Clock Out button so the employee
+             * does not need to scroll back to the main panel.
+             */
+            components: [
+              buildClockedInActions(),
+            ],
           });
 
           return;
@@ -441,15 +737,27 @@ client.on(
             `Time: **${formatPhilippineDateTime(
               now
             )}**`,
+            "",
+            "Use the **Clock Out** button below when your shift is finished.",
           ].join("\n"),
+
+          /*
+           * Clock Out button appears directly beneath
+           * the Clock In confirmation.
+           */
+          components: [
+            buildClockedInActions(),
+          ],
         });
 
         return;
       }
 
+      /*
+       * CLOCK OUT
+       */
       if (
-        interaction.customId ===
-        "time_clock_out"
+        customId === "time_clock_out"
       ) {
         if (
           record.clocked_in_at === null
@@ -457,14 +765,17 @@ client.on(
           await interaction.editReply({
             content:
               `⚠️ ${interaction.user}, you are not currently clocked in.`,
+
+            components: [
+              buildClockedOutActions(),
+            ],
           });
 
           return;
         }
 
-        const startedAt = Number(
-          record.clocked_in_at
-        );
+        const startedAt =
+          Number(record.clocked_in_at);
 
         const sessionMilliseconds =
           Math.max(0, now - startedAt);
@@ -485,9 +796,10 @@ client.on(
 
         await saveUserRecord(record);
 
-        const session = formatDuration(
-          sessionMilliseconds
-        );
+        const session =
+          formatDuration(
+            sessionMilliseconds
+          );
 
         const runningTotal =
           formatDuration(
@@ -506,15 +818,23 @@ client.on(
             )}**`,
             `Session: **${session.readable} (${session.decimalHours} hours)**`,
             `Current Total: **${runningTotal.readable} (${runningTotal.decimalHours} hours)**`,
+            "",
+            "You can clock in again or request Total Hours below.",
           ].join("\n"),
+
+          components: [
+            buildClockedOutActions(),
+          ],
         });
 
         return;
       }
 
+      /*
+       * TOTAL HOURS
+       */
       if (
-        interaction.customId ===
-        "time_total_hours"
+        customId === "time_total_hours"
       ) {
         if (
           record.clocked_in_at !== null
@@ -522,6 +842,10 @@ client.on(
           await interaction.editReply({
             content:
               `⚠️ ${interaction.user}, click **Clock Out** before requesting Total Hours.`,
+
+            components: [
+              buildClockedInActions(),
+            ],
           });
 
           return;
@@ -535,44 +859,51 @@ client.on(
           await interaction.editReply({
             content:
               `🧾 ${interaction.user}, you currently have **0.00 completed hours**.`,
+            components: [],
           });
 
           return;
         }
 
-        const submittedMilliseconds =
-          Number(
+        const total =
+          formatDuration(
             record.accumulated_milliseconds
           );
 
-        const submittedSessions =
+        const completedSessions =
           record.sessions.length;
 
-        const total = formatDuration(
-          submittedMilliseconds
-        );
-
-        record.accumulated_milliseconds = 0;
-        record.sessions = [];
-        record.last_submitted_at = now;
-        record.last_submitted_milliseconds =
-          submittedMilliseconds;
-
-        await saveUserRecord(record);
-
+        /*
+         * Do not reset the hours yet.
+         *
+         * Show a private explanation with Yes and No buttons.
+         */
         await interaction.editReply({
           content: [
-            "🧾 **TOTAL HOURS SUBMITTED AND RESET**",
+            "⚠️ **CONFIRM TOTAL HOURS**",
             `Employee: ${interaction.user}`,
-            `Completed Sessions: **${submittedSessions}**`,
-            `Total: **${total.readable}**`,
-            `Invoice Hours: **${total.decimalHours} hours**`,
-            `Submitted: **${formatPhilippineDateTime(
-              now
-            )}**`,
+            `Completed Sessions: **${completedSessions}**`,
+            `Total to submit: **${total.readable} (${total.decimalHours} hours)**`,
             "",
-            "This employee's completed total is now reset to **0.00 hours**.",
+            "Choosing **Yes, Submit & Reset** will:",
+            "• Post your completed total in this channel.",
+            "• Clear all completed sessions.",
+            "• Reset your completed hours to **0.00**.",
+            "",
+            "Choosing **No, Cancel** will make no changes.",
+            "",
+            "Do you want to continue?",
           ].join("\n"),
+
+          components: [
+            buildTotalHoursConfirmation(
+              userId,
+              Number(
+                record.accumulated_milliseconds
+              ),
+              completedSessions
+            ),
+          ],
         });
 
         return;
@@ -581,6 +912,7 @@ client.on(
       await interaction.editReply({
         content:
           "❌ Unknown time-clock action.",
+        components: [],
       });
     } catch (error) {
       console.error(
@@ -595,6 +927,7 @@ client.on(
         await interaction
           .editReply({
             content: errorMessage,
+            components: [],
           })
           .catch(console.error);
       } else {
